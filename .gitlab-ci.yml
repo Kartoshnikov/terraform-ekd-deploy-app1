@@ -1,0 +1,186 @@
+workflow:
+  rules:
+  - if: $CI_COMMIT_BRANCH
+
+.if-not-canary: &if-not-canary
+  if: $CANARY_PERCENTAGE != ""
+  when: never
+
+image: registry.gitlab.com/gitlab-org/terraform-images/stable:latest
+
+variables:
+  APP_VERSION:
+    description: "Version tag from Discount repository (e.g. 0.0.1)"
+  CANARY_PERCENTAGE:
+    description: "How many traffic (%) is going to be redirected to the canary version"
+  TF_VAR_CANARY_PERCENTAGE: $CANARY_PERCENTAGE
+  TF_ROOT: ${CI_PROJECT_DIR}
+  TF_ADDRESS: ${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/terraform/state/${CI_PROJECT_NAME}
+  TF_VAR_REPOSITORY_URL: git.example.com:5000/js/projects/discount
+  TF_VAR_REMOTE_STATE_PASSWORD: ${CI_JOB_TOKEN}
+  PROD_ENV_NAME: eks-production
+  TF_VAR_NAMESPACE: "${CI_PROJECT_NAME}-${CI_PROJECT_ID}-${PROD_ENV_NAME}"
+  TF_VAR_CI_PROJECT_PATH_SLUG: $CI_PROJECT_PATH_SLUG
+  TF_VAR_CI_ENVIRONMENT_SLUG: $PROD_ENV_NAME
+  STAGE: "stable"
+
+.canary:
+  variables:
+    TF_ROOT: ${CI_PROJECT_DIR}/canary
+    TF_ADDRESS: ${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/terraform/state/${CI_PROJECT_NAME}-canary
+    STAGE: "canary"
+
+cache:
+  key: production-$STAGE
+  paths:
+  - ${TF_ROOT}/.terraform
+  - ${TF_ROOT}/.terraform.lock.hcl
+
+before_script:
+- cd ${TF_ROOT}
+
+stages:
+- add-tag
+- validate
+- plan
+- apply
+
+
+get tag:
+  stage: add-tag
+  rules:
+  - *if-not-canary
+  - when: on_success
+  script:
+  - apk update && apk add git
+  - |
+    if [ "$APP_VERSION" == "" ]; then
+      mkdir welcome-code && cd welcome-code
+      git init
+      git remote add origin https://gitlab-ci-token:${CI_JOB_TOKEN}@git.example.com/js/projects/discount.git
+      git fetch --tags
+      APP_VERSION=$(git tag --sort v:refname | grep ^[0-9]*\.[0-9]*\.[0-9]*$ | tail -n 1)
+      cd ..
+      rm -rf welcome-code
+    fi
+  - echo "TF_VAR_DOCKER_TAG=$APP_VERSION" >> build.env
+  artifacts:
+    reports:
+      dotenv: build.env
+
+
+validate:
+  stage: validate
+  rules:
+  - *if-not-canary
+  - when: on_success
+  needs: [init]
+  script:
+  - gitlab-terraform validate
+
+validate-canary:
+  extends: [validate, .canary]
+  needs: [init-canary]
+  rules:
+  - *if-not-canary
+  - if: $CI_COMMIT_REF_NAME == "master"
+
+
+plan:
+  stage: plan
+  rules:
+  - *if-not-canary
+  - when: on_success
+  needs: 
+  - validate
+  - job: "get tag"
+    artifacts: true
+  script:
+  - gitlab-terraform plan
+  - gitlab-terraform plan-json
+  artifacts:
+    name: plan
+    paths:
+    - ${TF_ROOT}/plan.cache
+    reports:
+      terraform: ${TF_ROOT}/plan.json
+
+plan-canary:
+  extends: [plan, .canary]
+  needs: 
+  - validate-canary
+  - job: "get tag"
+    artifacts: true
+  rules:
+  - *if-not-canary
+  - if: $CI_COMMIT_REF_NAME == "master"
+
+
+apply:
+  stage: apply
+  rules:
+  - *if-not-canary
+  - if: $CI_COMMIT_REF_NAME == "master"
+    when: manual
+  script:
+  - gitlab-terraform apply
+  needs:
+  - plan
+  - job: "get tag"
+    artifacts: true
+  environment:
+    name: $PROD_ENV_NAME
+    on_stop: desctroy
+
+desctroy:
+  stage: apply
+  rules:
+  - *if-not-canary
+  - if: $CI_COMMIT_REF_NAME == "master"
+    when: manual
+  needs:
+  - plan
+  - job: "get tag"
+    artifacts: true
+  script:
+  - gitlab-terraform destroy
+  environment:
+    name: $PROD_ENV_NAME
+    action: stop
+
+apply-canary:
+  extends: [apply, .canary]
+  needs:
+  - plan-canary
+  - job: "get tag"
+    artifacts: true
+  environment:
+    name: $PROD_ENV_NAME
+
+desctroy-canary:
+  extends: [.canary]
+  stage: apply
+  needs:
+  - plan-canary
+  - job: "get tag"
+    artifacts: true
+  rules:
+  - *if-not-canary
+  - if: $CI_COMMIT_REF_NAME == "master"
+    when: manual
+  script:
+  - gitlab-terraform destroy
+  environment:
+    name: $PROD_ENV_NAME
+
+persentage-to-canary:
+  extends: [.canary]
+  stage: apply
+  rules:
+  - if: '$CI_COMMIT_REF_NAME == "master" && $CANARY_PERCENTAGE != ""'
+  script:
+  - gitlab-terraform plan -target kubernetes_ingress.ingress1 -target kubernetes_ingress.ingress2 
+  - gitlab-terraform plan-json -target kubernetes_ingress.ingress1 -target kubernetes_ingress.ingress2
+  - gitlab-terraform apply
+  environment:
+    name: $PROD_ENV_NAME
